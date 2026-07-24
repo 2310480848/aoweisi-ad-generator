@@ -1,0 +1,120 @@
+import { tool, jsonSchema, Tool } from "ai";
+import u from "@/utils";
+import { z } from "zod";
+import _ from "lodash";
+import ResTool from "@/socket/resTool";
+
+export const ScriptSchema = z.object({
+  name: z.string().describe("广告脚本名称"),
+  content: z.string().describe("广告脚本内容"),
+});
+export const planData = z.object({
+  storySkeleton: z.string().describe("广告策略框架"),
+  adaptationStrategy: z.string().describe("广告创意方案"),
+  script: z.string().describe("广告脚本内容"),
+});
+
+export type planData = z.infer<typeof planData>;
+
+const keySchema = z.enum(Object.keys(planData.shape) as [keyof planData, ...Array<keyof planData>]);
+const planDataKeyLabels = Object.fromEntries(
+  Object.entries(planData.shape).map(([key, schema]) => [key, (schema as z.ZodTypeAny).description ?? key]),
+) as Record<keyof planData, string>;
+
+interface ToolConfig {
+  resTool: ResTool;
+  toolsNames?: string[];
+  msg: ReturnType<ResTool["newMessage"]>;
+}
+
+export default (toolCpnfig: ToolConfig) => {
+  const { resTool, toolsNames, msg } = toolCpnfig;
+  const { socket } = resTool;
+  const tools: Record<string, Tool> = {
+    get_novel_events: tool({
+      description: "获取产品资料对应的广告卖点摘要",
+      inputSchema: jsonSchema<{ chapterIndexs: number[] }>(
+        z
+          .object({
+            chapterIndexs: z.array(z.number()).describe("产品资料编号"),
+          })
+          .toJSONSchema(),
+      ),
+      execute: async ({ chapterIndexs }) => {
+        console.log("[tools] get_novel_events", chapterIndexs);
+        const thinking = msg.thinking("正在查询产品卖点...");
+        const data = await u
+          .db("o_novel")
+          .where("projectId", resTool.data.projectId)
+          .select("id", "chapterIndex as index", "reel", "chapter", "chapterData", "event", "eventState")
+          .whereIn("chapterIndex", chapterIndexs);
+        thinking.appendText("正在查询产品资料编号: " + chapterIndexs.join(","));
+        const eventString = data.map((i: any) => [`资料${i.index}，标题:${i.chapter}，卖点:${i.event}`].join("\n")).join("\n");
+        thinking.appendText("查询结果:\n" + eventString);
+        thinking.updateTitle("查询产品卖点完成");
+        thinking.complete();
+        return eventString || "无数据";
+      },
+    }),
+    get_planData: tool({
+      description: "获取工作区数据",
+      inputSchema: jsonSchema<{ key: keyof planData }>(
+        z
+          .object({
+            key: keySchema.describe("数据key"),
+          })
+          .toJSONSchema(),
+      ),
+      execute: async ({ key }) => {
+        console.log("[tools] get_planData", key);
+        const thinking = msg.thinking(`正在获取${planDataKeyLabels[key]}工作区数据...`);
+        const planData: planData = await new Promise((resolve) => socket.emit("getPlanData", { key }, (res: any) => resolve(res)));
+        thinking.appendText(`获取到${planDataKeyLabels[key]}:\n` + planData[key]);
+        thinking.updateTitle(`获取${planDataKeyLabels[key]}完成`);
+        thinking.complete();
+        return planData[key] ?? "无数据";
+      },
+    }),
+    get_novel_text: tool({
+      description: "获取产品资料原始文本内容",
+      inputSchema: jsonSchema<{ chapterIndex: string }>(
+        z
+          .object({
+            chapterIndex: z.string().describe("产品资料编号"),
+          })
+          .toJSONSchema(),
+      ),
+      execute: async ({ chapterIndex }) => {
+        console.log("[tools] get_novel_text", "[tools] get_novel_text", chapterIndex);
+        const thinking = msg.thinking(`正在获取产品资料原文...`);
+        const data = await u.db("o_novel").where("projectId", resTool.data.projectId).where({ chapterIndex }).select("chapterData").first();
+        const text = data && data?.chapterData ? data.chapterData : "";
+        thinking.appendText(`获取到产品资料:\n` + text);
+        thinking.updateTitle(`获取产品资料原文完成`);
+        thinking.complete();
+        return text ?? "无数据";
+      },
+    }),
+    get_script_content: tool({
+      description: "获取广告脚本内容",
+      inputSchema: jsonSchema<{ ids: string[] }>(
+        z
+          .object({
+            ids: z.array(z.string()).describe("脚本id"),
+          })
+          .toJSONSchema(),
+      ),
+      execute: async ({ ids }) => {
+        console.log("[tools] get_script_content", "[tools] get_script_content", ids);
+        const thinking = msg.thinking(`正在获取广告脚本内容...`);
+        const data = await u.db("o_script").whereIn("id", ids).select("content", "name");
+        const text = data && data.length ? data.map((d) => `<scriptItem name="${d.name}">${d.content}</scriptItem>`).join("\n") : "";
+        thinking.appendText(`获取到广告脚本内容:\n` + JSON.stringify(data, null, 2));
+        thinking.updateTitle(`获取广告脚本内容完成`);
+        thinking.complete();
+        return text ?? "无数据";
+      },
+    }),
+  };
+  return toolsNames ? Object.fromEntries(Object.entries(tools).filter(([n]) => toolsNames.includes(n))) : tools;
+};
