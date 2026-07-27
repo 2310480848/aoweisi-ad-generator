@@ -30,10 +30,12 @@ export default function runCode(code: string, vendor?: Record<string, any>) {
     createGoogleGenerativeAI,
     zipImage,
     zipImageResolution,
+    base64ToFileUrl,
     urlToBase64,
     mergeImages,
     pollTask,
     fetch: fetch,
+    Buffer,
     exports,
     axios,
     FormData,
@@ -85,6 +87,31 @@ export async function urlToBase64(url: string): Promise<string> {
   const mime = res.headers["content-type"] || "image/jpeg";
   const b64 = Buffer.from(res.data).toString("base64");
   return `data:${mime};base64,${b64}`;
+}
+
+export async function base64ToFileUrl(dataUrl: string, fileType: "image" | "audio" | "video" = "image"): Promise<string> {
+  if (/^https?:\/\//i.test(dataUrl)) return dataUrl;
+  if (dataUrl.startsWith("/") || /^[\w./\\-]+\.(png|jpe?g|webp|gif|mp4|mp3)$/i.test(dataUrl)) {
+    return await u.oss.getFileUrl(u.replaceUrl(dataUrl));
+  }
+
+  const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+  const mime = match?.[1] || (fileType === "video" ? "video/mp4" : fileType === "audio" ? "audio/mpeg" : "image/jpeg");
+  const base64 = match?.[2] || dataUrl;
+  const extMap: Record<string, string> = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "video/mp4": "mp4",
+    "audio/mpeg": "mp3",
+  };
+  const ext = extMap[mime] || mime.split("/")[1] || "bin";
+  const hash = crypto.createHash("sha256").update(base64).digest("hex").slice(0, 24);
+  const savePath = `vendor-refs/${fileType}/${hash}.${ext}`;
+
+  await u.oss.writeFile(savePath, Buffer.from(base64, "base64"));
+  return await u.oss.getFileUrl(savePath);
 }
 
 export async function pollTask(

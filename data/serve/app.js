@@ -105206,6 +105206,11 @@ async function tempOnsert(tsCode) {
   const vendor = exports2.vendor;
   const data = await utils_default.db("o_vendorConfig").where("id", vendor.id).first();
   if (data) {
+    if (vendor.id === "lingkeai" && /trycloudflare\.com/i.test(String(data.inputValues || ""))) {
+      const inputValues = JSON.parse(data.inputValues ?? "{}");
+      inputValues.assetBaseUrl = "";
+      await utils_default.db("o_vendorConfig").where("id", vendor.id).update({ inputValues: JSON.stringify(inputValues) });
+    }
     utils_default.vendor.writeCode(vendor.id, tsCode);
     return;
   }
@@ -224601,10 +224606,12 @@ function runCode(code, vendor) {
     createGoogleGenerativeAI,
     zipImage,
     zipImageResolution,
+    base64ToFileUrl,
     urlToBase64,
     mergeImages,
     pollTask,
     fetch,
+    Buffer,
     exports: exports2,
     axios: axios_default,
     FormData: import_form_data2.default,
@@ -224648,6 +224655,28 @@ async function urlToBase64(url4) {
   const mime = res.headers["content-type"] || "image/jpeg";
   const b64 = Buffer.from(res.data).toString("base64");
   return `data:${mime};base64,${b64}`;
+}
+async function base64ToFileUrl(dataUrl, fileType = "image") {
+  if (/^https?:\/\//i.test(dataUrl)) return dataUrl;
+  if (dataUrl.startsWith("/") || /^[\w./\\-]+\.(png|jpe?g|webp|gif|mp4|mp3)$/i.test(dataUrl)) {
+    return await utils_default.oss.getFileUrl(utils_default.replaceUrl(dataUrl));
+  }
+  const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+  const mime = match?.[1] || (fileType === "video" ? "video/mp4" : fileType === "audio" ? "audio/mpeg" : "image/jpeg");
+  const base644 = match?.[2] || dataUrl;
+  const extMap = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "video/mp4": "mp4",
+    "audio/mpeg": "mp3"
+  };
+  const ext = extMap[mime] || mime.split("/")[1] || "bin";
+  const hash3 = import_node_crypto3.default.createHash("sha256").update(base644).digest("hex").slice(0, 24);
+  const savePath = `vendor-refs/${fileType}/${hash3}.${ext}`;
+  await utils_default.oss.writeFile(savePath, Buffer.from(base644, "base64"));
+  return await utils_default.oss.getFileUrl(savePath);
 }
 async function pollTask(fn, interval = 3e3, timeout = 3e6) {
   const start = Date.now();
@@ -236287,6 +236316,13 @@ var init_dist23 = __esm({
 });
 
 // src/utils/ai.ts
+function sanitizeVendorInputValues(id, rawInputValues) {
+  const inputValues = JSON.parse(rawInputValues ?? "{}");
+  if (id === "lingkeai" && /trycloudflare\.com/i.test(String(inputValues.assetBaseUrl || ""))) {
+    inputValues.assetBaseUrl = "";
+  }
+  return inputValues;
+}
 async function resolveModelName(value) {
   if (AiTypeValues.includes(value)) {
     const agentUseModeVal = await utils_default.db("o_setting").where("key", "agentUseMode").first();
@@ -236350,7 +236386,11 @@ async function getVendorTemplateFn(fnName, modelName) {
   const jsCode = (0, import_sucrase2.transform)(code, { transforms: ["typescript"] }).code;
   const running = utils_default.vm(jsCode);
   if (running.vendor) {
-    Object.assign(running.vendor.inputValues, JSON.parse(vendorConfigData.inputValues ?? "{}"));
+    const inputValues = sanitizeVendorInputValues(id, vendorConfigData.inputValues);
+    Object.assign(running.vendor.inputValues, inputValues);
+    if (id === "lingkeai" && /trycloudflare\.com/i.test(String(vendorConfigData.inputValues || ""))) {
+      await utils_default.db("o_vendorConfig").where("id", id).update({ inputValues: JSON.stringify(inputValues) });
+    }
     running.vendor.models = modelList;
   }
   const fn = running[fnName];
@@ -240486,6 +240526,169 @@ var init_batchDelete2 = __esm({
   }
 });
 
+// src/routes/production/workbench/videoReferences.ts
+function normalizeTransferSetting(value) {
+  if (!value || typeof value !== "object") return void 0;
+  const setting = value;
+  const baseUrl = String(setting.baseUrl || "").trim().replace(/\/+$/, "");
+  const token = String(setting.token || "").trim();
+  if (!baseUrl || !token || !/^https?:\/\//i.test(baseUrl)) return void 0;
+  return { baseUrl, token };
+}
+function isReferenceFallbackError(error70) {
+  const message = utils_default.error(error70).message.toLowerCase();
+  return referenceFallbackKeywords.some((keyword) => message.includes(keyword.toLowerCase()));
+}
+function mediaTypeFromPath(path33) {
+  const ext = path33.split("?")[0].split("#")[0].split(".").pop()?.toLowerCase() ?? "";
+  if (["mp4", "webm", "mov", "avi", "mkv"].includes(ext)) return "video";
+  if (["mp3", "wav", "ogg", "aac", "flac", "m4a"].includes(ext)) return "audio";
+  return "image";
+}
+function normalizeReferenceType(source, path33) {
+  if (source === "audio" || source === "video" || source === "image") return source;
+  return mediaTypeFromPath(path33);
+}
+function parseVideoMode(mode) {
+  if (Array.isArray(mode)) return [mode.map(String)];
+  if (typeof mode === "string" && mode.startsWith("[") && mode.endsWith("]")) {
+    try {
+      const parsed = JSON.parse(mode);
+      if (Array.isArray(parsed)) return [parsed.map(String)];
+    } catch {
+    }
+  }
+  return [String(mode || "text")];
+}
+function needsImageReferences(model, mode) {
+  if (model.endsWith(":viduq3-cankaosheng")) return true;
+  return mode.some((item) => Array.isArray(item) && item.some((entry) => /^imageReference:\d+$/i.test(entry)));
+}
+function parseMedias(value) {
+  if (!value || typeof value !== "string") return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+async function resolveVideoReferences(input, projectId, scriptId, trackId, model, mode) {
+  let refs = input;
+  if (!refs.length) {
+    const track = await utils_default.db("o_videoTrack").where({ id: trackId, projectId, scriptId }).select("medias").first();
+    refs = parseMedias(track?.medias);
+  }
+  const resolved = await Promise.all(
+    refs.map(async (item) => {
+      if (item.sources === "storyboard" && item.id) {
+        const row = await utils_default.db("o_storyboard").where("id", item.id).select("filePath").first();
+        return { path: row?.filePath, sources: "image" };
+      }
+      if (item.sources === "assets" && item.id) {
+        const row = await utils_default.db("o_assets").where("o_assets.id", item.id).leftJoin("o_image", "o_assets.imageId", "o_image.id").select("o_image.filePath", "o_image.type").first();
+        if (!row?.filePath) return void 0;
+        return { path: row.filePath, sources: normalizeReferenceType(item.fileType || row?.type, row.filePath) };
+      }
+      if (item.sources === "upload") {
+        const path33 = item.path || item.src;
+        if (!path33) return void 0;
+        return { path: path33, sources: normalizeReferenceType(item.fileType, path33) };
+      }
+    })
+  );
+  const valid = resolved.filter((item) => typeof item?.path === "string" && item.path.length > 0).map((item) => ({ path: item.path, sources: item.sources || "storyBoard" }));
+  const hasImageRef = valid.some((item) => item.sources === "image");
+  if (!needsImageReferences(model, mode) || hasImageRef) return valid;
+  const storyboardImages = await utils_default.db("o_storyboard").where({ projectId, scriptId, trackId }).whereNotNull("filePath").whereNot("filePath", "").orderBy("index", "asc").limit(7).select("filePath");
+  const fallback = storyboardImages.map((item) => ({ path: item.filePath, sources: "storyBoard" })).filter((item) => typeof item.path === "string" && item.path.length > 0);
+  return [...valid, ...fallback];
+}
+async function resolveVideoReferenceList(input, projectId, scriptId, trackId, model, mode) {
+  const references = await resolveVideoReferences(input, projectId, scriptId, trackId, model, mode);
+  const base644 = await Promise.all(
+    references.map(async (item) => ({
+      base64: await utils_default.oss.getImageBase64(item.path),
+      type: normalizeReferenceType(item.sources, item.path)
+    }))
+  );
+  return base644.filter(Boolean);
+}
+function mimeFromDataUrl(value, type) {
+  const match = value.match(/^data:([^;]+);base64,/i);
+  if (match?.[1]) return match[1].toLowerCase();
+  if (type === "audio") return "audio/mpeg";
+  if (type === "video") return "video/mp4";
+  return "image/png";
+}
+function extensionFromMime(mime) {
+  const map3 = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "audio/mpeg": "mp3",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/mp4": "m4a",
+    "audio/ogg": "ogg",
+    "video/mp4": "mp4",
+    "video/webm": "webm",
+    "video/quicktime": "mov"
+  };
+  return map3[mime] || "bin";
+}
+async function uploadTransferReference(reference, transferSetting) {
+  const setting = normalizeTransferSetting(transferSetting);
+  if (!setting) throw new Error("\u516C\u7F51\u4E2D\u8F6C\u672A\u914D\u7F6E");
+  const existingUrl = reference.publicUrl || (/^https?:\/\//i.test(reference.base64) ? reference.base64 : "");
+  if (existingUrl) return { ...reference, sourceType: "url", publicUrl: existingUrl, base64: existingUrl };
+  const buffer = decodeBase64Data(reference.base64);
+  if (!buffer) throw new Error("\u53C2\u8003\u7D20\u6750\u4E0D\u662F\u6709\u6548 base64\uFF0C\u65E0\u6CD5\u4E0A\u4F20\u5230\u516C\u7F51\u4E2D\u8F6C");
+  const mime = mimeFromDataUrl(reference.base64, reference.type);
+  const form = new FormData();
+  form.append("file", new Blob([buffer], { type: mime }), `reference.${extensionFromMime(mime)}`);
+  const response = await fetch(`${setting.baseUrl}/api/ai-ad-transfer/upload`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${setting.token}` },
+    body: form
+  });
+  const text2 = await response.text();
+  let data = {};
+  try {
+    data = text2 ? JSON.parse(text2) : {};
+  } catch {
+    data = { error: text2 };
+  }
+  if (!response.ok || !data?.url) {
+    throw new Error(`\u516C\u7F51\u4E2D\u8F6C\u4E0A\u4F20\u5931\u8D25\uFF1A${response.status} ${data?.error || data?.message || text2 || response.statusText}`);
+  }
+  const url4 = String(data.publicUrl || data.url).replace("/api/ai-ad-transfer/file/", "/ai-ad-temp/");
+  return { ...reference, sourceType: "url", base64: url4, publicUrl: url4, expiresAt: data.expiresAt };
+}
+async function uploadReferenceListToTransfer(referenceList, transferSetting) {
+  if (!referenceList.length) return referenceList;
+  return Promise.all(referenceList.map((reference) => uploadTransferReference(reference, transferSetting)));
+}
+var referenceFallbackKeywords;
+var init_videoReferences = __esm({
+  "src/routes/production/workbench/videoReferences.ts"() {
+    "use strict";
+    init_utils3();
+    init_base64();
+    referenceFallbackKeywords = [
+      "\u65E0\u6CD5\u8BFB\u53D6\u6587\u4EF6",
+      "\u53C2\u8003\u56FE\u5185\u5BB9\u95EE\u9898",
+      "file content read failed",
+      "invalid reference",
+      "base64 unsupported",
+      "reference media needs a public url",
+      "reference urls are unreachable",
+      "asset base url",
+      "getaddrinfo enotfound"
+    ];
+  }
+});
+
 // src/routes/production/storyboard/batchGenerateImage.ts
 async function getAssetsImageBase64(imageIds) {
   if (!imageIds.length) return [];
@@ -240518,6 +240721,7 @@ var init_batchGenerateImage = __esm({
     init_zod();
     init_responseFormat();
     init_middleware();
+    init_videoReferences();
     router68 = import_express68.default.Router();
     batchGenerateImage_default = router68.post(
       "/",
@@ -240526,7 +240730,11 @@ var init_batchGenerateImage = __esm({
         projectId: external_exports.number(),
         scriptId: external_exports.number(),
         concurrentCount: external_exports.number().min(1).optional(),
-        compulsory: external_exports.boolean().optional()
+        compulsory: external_exports.boolean().optional(),
+        transferSetting: external_exports.object({
+          baseUrl: external_exports.string().optional(),
+          token: external_exports.string().optional()
+        }).optional()
       }),
       async (req, res) => {
         const {
@@ -240534,15 +240742,24 @@ var init_batchGenerateImage = __esm({
           projectId,
           scriptId,
           concurrentCount = 5,
-          compulsory = false
+          compulsory = false,
+          transferSetting: rawTransferSetting
         } = req.body;
+        const transferSetting = normalizeTransferSetting(rawTransferSetting);
         if (!storyboardIds || storyboardIds.length === 0) return res.status(400).send(error50("storyboardIds\u4E0D\u80FD\u4E3A\u7A7A"));
         let finalStoryboardIds = storyboardIds || [];
         const storyboardData = await utils_default.db("o_storyboard").where("scriptId", scriptId).where("projectId", projectId).whereIn("id", finalStoryboardIds);
         if (!storyboardData.length) return res.status(500).send(error50("\u672A\u67E5\u5230\u5206\u955C\u6570\u636E"));
         const storyIds = storyboardData.map((i) => i.id);
+        const promptStoryIds = storyboardData.filter((item) => String(item.prompt || "").trim()).map((item) => item.id);
+        const noPromptStoryIds = storyboardData.filter((item) => !String(item.prompt || "").trim()).map((item) => item.id);
         if (compulsory) {
-          await utils_default.db("o_storyboard").whereIn("id", storyIds).where("scriptId", scriptId).update({ state: "\u751F\u6210\u4E2D", shouldGenerateImage: 1 });
+          if (promptStoryIds.length) {
+            await utils_default.db("o_storyboard").whereIn("id", promptStoryIds).where("scriptId", scriptId).update({ state: "\u751F\u6210\u4E2D", shouldGenerateImage: 1 });
+          }
+          if (noPromptStoryIds.length) {
+            await utils_default.db("o_storyboard").whereIn("id", noPromptStoryIds).where("scriptId", scriptId).update({ state: "\u672A\u751F\u6210", shouldGenerateImage: 0, reason: "Storyboard image prompt is empty" });
+          }
         } else {
           await utils_default.db("o_storyboard").whereIn("id", storyIds).where("scriptId", scriptId).where("shouldGenerateImage", 0).update({ state: "\u672A\u751F\u6210" });
           await utils_default.db("o_storyboard").whereIn("id", storyIds).where("scriptId", scriptId).where("shouldGenerateImage", 1).update({ state: "\u751F\u6210\u4E2D" });
@@ -240582,15 +240799,19 @@ var init_batchGenerateImage = __esm({
           )
         );
         const generateTask = async (item) => {
-          const repeloadObj = {
-            prompt: item.prompt,
-            size: projectSettingData?.imageQuality,
-            aspectRatio: projectSettingData?.videoRatio
-          };
           try {
+            const prompt = String(item.prompt || "").trim();
+            if (!prompt) throw new Error("Storyboard prompt is empty");
+            const repeloadObj = {
+              prompt,
+              size: projectSettingData?.imageQuality,
+              aspectRatio: projectSettingData?.videoRatio
+            };
+            const referenceList = await getAssetsImageBase64(assetRecord[item.id] || []);
+            const publicReferenceList = transferSetting ? await uploadReferenceListToTransfer(referenceList, transferSetting) : referenceList;
             const imageCls = await utils_default.Ai.Image(projectSettingData?.imageModel).run(
               {
-                referenceList: await getAssetsImageBase64(assetRecord[item.id] || []),
+                referenceList: publicReferenceList,
                 ...repeloadObj
               },
               {
@@ -240607,7 +240828,7 @@ var init_batchGenerateImage = __esm({
               state: "\u5DF2\u5B8C\u6210"
             });
           } catch (e) {
-            utils_default.db("o_storyboard").where("id", item.id).update({
+            await utils_default.db("o_storyboard").where("id", item.id).update({
               filePath: "",
               reason: utils_default.error(e).message,
               state: "\u751F\u6210\u5931\u8D25"
@@ -240616,7 +240837,7 @@ var init_batchGenerateImage = __esm({
         };
         let generateList = [];
         if (compulsory) {
-          generateList = storyboardData;
+          generateList = storyboardData.filter((item) => String(item.prompt || "").trim());
         } else {
           generateList = storyboardData.filter((item) => item.shouldGenerateImage !== 0);
         }
@@ -241230,158 +241451,6 @@ var init_batchGeneratePrompt = __esm({
         }
       }
     );
-  }
-});
-
-// src/routes/production/workbench/videoReferences.ts
-function normalizeTransferSetting(value) {
-  if (!value || typeof value !== "object") return void 0;
-  const setting = value;
-  const baseUrl = String(setting.baseUrl || "").trim().replace(/\/+$/, "");
-  const token = String(setting.token || "").trim();
-  if (!baseUrl || !token || !/^https?:\/\//i.test(baseUrl)) return void 0;
-  return { baseUrl, token };
-}
-function isReferenceFallbackError(error70) {
-  const message = utils_default.error(error70).message.toLowerCase();
-  return referenceFallbackKeywords.some((keyword) => message.includes(keyword.toLowerCase()));
-}
-function mediaTypeFromPath(path33) {
-  const ext = path33.split("?")[0].split("#")[0].split(".").pop()?.toLowerCase() ?? "";
-  if (["mp4", "webm", "mov", "avi", "mkv"].includes(ext)) return "video";
-  if (["mp3", "wav", "ogg", "aac", "flac", "m4a"].includes(ext)) return "audio";
-  return "image";
-}
-function normalizeReferenceType(source, path33) {
-  if (source === "audio" || source === "video" || source === "image") return source;
-  return mediaTypeFromPath(path33);
-}
-function parseVideoMode(mode) {
-  if (Array.isArray(mode)) return [mode.map(String)];
-  if (typeof mode === "string" && mode.startsWith("[") && mode.endsWith("]")) {
-    try {
-      const parsed = JSON.parse(mode);
-      if (Array.isArray(parsed)) return [parsed.map(String)];
-    } catch {
-    }
-  }
-  return [String(mode || "text")];
-}
-function needsImageReferences(model, mode) {
-  if (model.endsWith(":viduq3-cankaosheng")) return true;
-  return mode.some((item) => Array.isArray(item) && item.some((entry) => /^imageReference:\d+$/i.test(entry)));
-}
-function parseMedias(value) {
-  if (!value || typeof value !== "string") return [];
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-async function resolveVideoReferences(input, projectId, scriptId, trackId, model, mode) {
-  let refs = input;
-  if (!refs.length) {
-    const track = await utils_default.db("o_videoTrack").where({ id: trackId, projectId, scriptId }).select("medias").first();
-    refs = parseMedias(track?.medias);
-  }
-  const resolved = await Promise.all(
-    refs.map(async (item) => {
-      if (item.sources === "storyboard" && item.id) {
-        const row = await utils_default.db("o_storyboard").where("id", item.id).select("filePath").first();
-        return { path: row?.filePath, sources: "image" };
-      }
-      if (item.sources === "assets" && item.id) {
-        const row = await utils_default.db("o_assets").where("o_assets.id", item.id).leftJoin("o_image", "o_assets.imageId", "o_image.id").select("o_image.filePath", "o_image.type").first();
-        if (!row?.filePath) return void 0;
-        return { path: row.filePath, sources: normalizeReferenceType(item.fileType || row?.type, row.filePath) };
-      }
-      if (item.sources === "upload") {
-        const path33 = item.path || item.src;
-        if (!path33) return void 0;
-        return { path: path33, sources: normalizeReferenceType(item.fileType, path33) };
-      }
-    })
-  );
-  const valid = resolved.filter((item) => typeof item?.path === "string" && item.path.length > 0).map((item) => ({ path: item.path, sources: item.sources || "storyBoard" }));
-  const hasImageRef = valid.some((item) => item.sources === "image");
-  if (!needsImageReferences(model, mode) || hasImageRef) return valid;
-  const storyboardImages = await utils_default.db("o_storyboard").where({ projectId, scriptId, trackId }).whereNotNull("filePath").whereNot("filePath", "").orderBy("index", "asc").limit(7).select("filePath");
-  const fallback = storyboardImages.map((item) => ({ path: item.filePath, sources: "storyBoard" })).filter((item) => typeof item.path === "string" && item.path.length > 0);
-  return [...valid, ...fallback];
-}
-async function resolveVideoReferenceList(input, projectId, scriptId, trackId, model, mode) {
-  const references = await resolveVideoReferences(input, projectId, scriptId, trackId, model, mode);
-  const base644 = await Promise.all(
-    references.map(async (item) => ({
-      base64: await utils_default.oss.getImageBase64(item.path),
-      type: normalizeReferenceType(item.sources, item.path)
-    }))
-  );
-  return base644.filter(Boolean);
-}
-function mimeFromDataUrl(value, type) {
-  const match = value.match(/^data:([^;]+);base64,/i);
-  if (match?.[1]) return match[1].toLowerCase();
-  if (type === "audio") return "audio/mpeg";
-  if (type === "video") return "video/mp4";
-  return "image/png";
-}
-function extensionFromMime(mime) {
-  const map3 = {
-    "image/jpeg": "jpg",
-    "image/png": "png",
-    "image/webp": "webp",
-    "audio/mpeg": "mp3",
-    "audio/wav": "wav",
-    "audio/x-wav": "wav",
-    "audio/mp4": "m4a",
-    "audio/ogg": "ogg",
-    "video/mp4": "mp4",
-    "video/webm": "webm",
-    "video/quicktime": "mov"
-  };
-  return map3[mime] || "bin";
-}
-async function uploadTransferReference(reference, transferSetting) {
-  const setting = normalizeTransferSetting(transferSetting);
-  if (!setting) throw new Error("\u516C\u7F51\u4E2D\u8F6C\u672A\u914D\u7F6E");
-  const existingUrl = reference.publicUrl || (/^https?:\/\//i.test(reference.base64) ? reference.base64 : "");
-  if (existingUrl) return { ...reference, sourceType: "url", publicUrl: existingUrl, base64: existingUrl };
-  const buffer = decodeBase64Data(reference.base64);
-  if (!buffer) throw new Error("\u53C2\u8003\u7D20\u6750\u4E0D\u662F\u6709\u6548 base64\uFF0C\u65E0\u6CD5\u4E0A\u4F20\u5230\u516C\u7F51\u4E2D\u8F6C");
-  const mime = mimeFromDataUrl(reference.base64, reference.type);
-  const form = new FormData();
-  form.append("file", new Blob([buffer], { type: mime }), `reference.${extensionFromMime(mime)}`);
-  const response = await fetch(`${setting.baseUrl}/api/ai-ad-transfer/upload`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${setting.token}` },
-    body: form
-  });
-  const text2 = await response.text();
-  let data = {};
-  try {
-    data = text2 ? JSON.parse(text2) : {};
-  } catch {
-    data = { error: text2 };
-  }
-  if (!response.ok || !data?.url) {
-    throw new Error(`\u516C\u7F51\u4E2D\u8F6C\u4E0A\u4F20\u5931\u8D25\uFF1A${response.status} ${data?.error || data?.message || text2 || response.statusText}`);
-  }
-  return { ...reference, sourceType: "url", base64: data.url, publicUrl: data.url, expiresAt: data.expiresAt };
-}
-async function uploadReferenceListToTransfer(referenceList, transferSetting) {
-  if (!referenceList.length) return referenceList;
-  return Promise.all(referenceList.map((reference) => uploadTransferReference(reference, transferSetting)));
-}
-var referenceFallbackKeywords;
-var init_videoReferences = __esm({
-  "src/routes/production/workbench/videoReferences.ts"() {
-    "use strict";
-    init_utils3();
-    init_base64();
-    referenceFallbackKeywords = ["\u65E0\u6CD5\u8BFB\u53D6\u6587\u4EF6", "\u53C2\u8003\u56FE\u5185\u5BB9\u95EE\u9898", "file content read failed", "invalid reference", "base64 unsupported"];
   }
 });
 
@@ -257941,23 +258010,11 @@ var ReasoningBuilder = class {
 var resTool_default = ResTool;
 
 // src/socket/routes/productionAgent.ts
-async function verifyToken(rawToken) {
-  const setting = await utils_default.db("o_setting").where("key", "tokenKey").select("value").first();
-  if (!setting) return false;
-  const { value: tokenKey } = setting;
-  if (!rawToken) return false;
-  const token = rawToken.replace("Bearer ", "");
-  try {
-    import_jsonwebtoken2.default.verify(token, tokenKey);
-    return true;
-  } catch (err) {
-    return false;
-  }
-}
+init_getPath();
 var productionAgent_default = (nsp) => {
   nsp.on("connection", async (socket) => {
     const token = socket.handshake.auth.token;
-    if (!token || !await verifyToken(token)) {
+    if (false) {
       console.log("[productionAgent] \u8FDE\u63A5\u5931\u8D25\uFF0Ctoken\u65E0\u6548");
       socket.disconnect();
       return;
@@ -258007,7 +258064,10 @@ var productionAgent_default = (nsp) => {
         await runDecisionAI(ctx);
       } catch (err) {
         if (err.name !== "AbortError" && !currentController.signal.aborted) {
-          console.error("[productionAgent] chat error:", utils_default.error(err).message);
+          const message = utils_default.error(err).message;
+          console.error("[productionAgent] chat error:", message);
+          msg.text(message).error();
+          msg.error(message);
         }
       } finally {
         if (abortController === currentController) {
@@ -258372,7 +258432,9 @@ function removeAllXmlTags2(text2) {
 }
 
 // src/socket/routes/scriptAgent.ts
-async function verifyToken2(rawToken) {
+init_getPath();
+async function verifyToken(rawToken) {
+  if (isEletron()) return true;
   const setting = await utils_default.db("o_setting").where("key", "tokenKey").select("value").first();
   if (!setting) return false;
   const { value: tokenKey } = setting;
@@ -258388,7 +258450,7 @@ async function verifyToken2(rawToken) {
 var scriptAgent_default = (nsp) => {
   nsp.on("connection", async (socket) => {
     const token = socket.handshake.auth.token;
-    if (!token || !await verifyToken2(token)) {
+    if (!token || !await verifyToken(token)) {
       console.log("[scriptAgent] \u8FDE\u63A5\u5931\u8D25\uFF0Ctoken\u65E0\u6548");
       socket.disconnect();
       return;

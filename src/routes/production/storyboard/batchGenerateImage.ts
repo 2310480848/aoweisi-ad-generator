@@ -6,6 +6,7 @@ import { error, success } from "@/lib/responseFormat";
 import { validateFields } from "@/middleware/middleware";
 import { Output, tool } from "ai";
 import { assetItemSchema } from "@/agents/productionAgent/tools";
+import { normalizeTransferSetting, uploadReferenceListToTransfer } from "@/routes/production/workbench/videoReferences";
 const router = express.Router();
 export type AssetData = z.infer<typeof assetItemSchema>;
 
@@ -17,6 +18,12 @@ export default router.post(
     scriptId: z.number(),
     concurrentCount: z.number().min(1).optional(),
     compulsory: z.boolean().optional(),
+    transferSetting: z
+      .object({
+        baseUrl: z.string().optional(),
+        token: z.string().optional(),
+      })
+      .optional(),
   }),
   async (req, res) => {
     const {
@@ -25,13 +32,16 @@ export default router.post(
       scriptId,
       concurrentCount = 5,
       compulsory = false,
+      transferSetting: rawTransferSetting,
     }: {
       storyboardIds: number[];
       projectId: number;
       scriptId: number;
       concurrentCount: number;
       compulsory: boolean;
+      transferSetting?: { baseUrl?: string; token?: string };
     } = req.body;
+    const transferSetting = normalizeTransferSetting(rawTransferSetting);
     if (!storyboardIds || storyboardIds.length === 0) return res.status(400).send(error("storyboardIds不能为空"));
     // 当没有 storyboardIds 时，通过 AI 生成新的分镜面板数据
     let finalStoryboardIds: number[] = storyboardIds || [];
@@ -39,8 +49,19 @@ export default router.post(
     const storyboardData = await u.db("o_storyboard").where("scriptId", scriptId).where("projectId", projectId).whereIn("id", finalStoryboardIds);
     if (!storyboardData.length) return res.status(500).send(error("未查到分镜数据"));
     const storyIds = storyboardData.map((i) => i.id);
+    const promptStoryIds = storyboardData.filter((item) => String(item.prompt || "").trim()).map((item) => item.id);
+    const noPromptStoryIds = storyboardData.filter((item) => !String(item.prompt || "").trim()).map((item) => item.id);
     if (compulsory) {
-      await u.db("o_storyboard").whereIn("id", storyIds).where("scriptId", scriptId).update({ state: "生成中", shouldGenerateImage: 1 });
+      if (promptStoryIds.length) {
+        await u.db("o_storyboard").whereIn("id", promptStoryIds).where("scriptId", scriptId).update({ state: "生成中", shouldGenerateImage: 1 });
+      }
+      if (noPromptStoryIds.length) {
+        await u
+          .db("o_storyboard")
+          .whereIn("id", noPromptStoryIds)
+          .where("scriptId", scriptId)
+          .update({ state: "未生成", shouldGenerateImage: 0, reason: "Storyboard image prompt is empty" });
+      }
     } else {
       await u.db("o_storyboard").whereIn("id", storyIds).where("scriptId", scriptId).where("shouldGenerateImage", 0).update({ state: "未生成" });
       await u.db("o_storyboard").whereIn("id", storyIds).where("scriptId", scriptId).where("shouldGenerateImage", 1).update({ state: "生成中" });
@@ -92,15 +113,19 @@ export default router.post(
     );
 
     const generateTask = async (item: (typeof storyboardData)[number]) => {
-      const repeloadObj = {
-        prompt: item.prompt!,
-        size: projectSettingData?.imageQuality as "1K" | "2K" | "4K",
-        aspectRatio: projectSettingData?.videoRatio as `${number}:${number}`,
-      };
       try {
+        const prompt = String(item.prompt || "").trim();
+        if (!prompt) throw new Error("Storyboard prompt is empty");
+        const repeloadObj = {
+          prompt,
+          size: projectSettingData?.imageQuality as "1K" | "2K" | "4K",
+          aspectRatio: projectSettingData?.videoRatio as `${number}:${number}`,
+        };
+        const referenceList = await getAssetsImageBase64(assetRecord[item.id!] || []);
+        const publicReferenceList = transferSetting ? await uploadReferenceListToTransfer(referenceList, transferSetting) : referenceList;
         const imageCls = await u.Ai.Image(projectSettingData?.imageModel as `${string}:${string}`).run(
           {
-            referenceList: await getAssetsImageBase64(assetRecord[item.id!] || []),
+            referenceList: publicReferenceList,
             ...repeloadObj,
           },
           {
@@ -117,7 +142,8 @@ export default router.post(
           state: "已完成",
         });
       } catch (e) {
-        u.db("o_storyboard")
+        await u
+          .db("o_storyboard")
           .where("id", item.id)
           .update({
             filePath: "",
@@ -129,7 +155,7 @@ export default router.post(
     // 按 concurrentCount 控制并发数，分批执行；跳过 shouldGenerateImage === 0 的分镜
     let generateList = [];
     if (compulsory) {
-      generateList = storyboardData;
+      generateList = storyboardData.filter((item) => String(item.prompt || "").trim());
     } else {
       generateList = storyboardData.filter((item) => item.shouldGenerateImage !== 0);
     }

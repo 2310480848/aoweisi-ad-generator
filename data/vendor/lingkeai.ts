@@ -275,7 +275,7 @@ const vendor: VendorConfig = {
   inputValues: {
     apiKey: "",
     baseUrl: "https://api.lk888.ai/v1",
-    assetBaseUrl: "https://fisher-container-xhtml-buttons.trycloudflare.com/oss",
+    assetBaseUrl: "",
   },
   models: [...textModels, ...imageModels, ...videoModels, ...ttsModels],
 };
@@ -392,7 +392,8 @@ const toBase64 = async (value: string): Promise<string> => {
 };
 
 const toPublicRefs = async (refs: ReferenceList[], fileType: "image" | "audio" | "video"): Promise<string[]> => {
-  const baseUrl = vendor.inputValues.assetBaseUrl?.replace(/\/+$/, "");
+  const configuredBaseUrl = vendor.inputValues.assetBaseUrl?.replace(/\/+$/, "") || "";
+  const baseUrl = /trycloudflare\.com/i.test(configuredBaseUrl) ? "" : configuredBaseUrl;
   const urls = await Promise.all(
     refs.map(async (ref) => {
       const publicRef = ref.publicUrl || (/^https?:\/\//i.test(ref.base64) ? ref.base64 : "");
@@ -478,8 +479,19 @@ const modeRequiresImage = (mode: any): boolean => {
   return entries.some((entry) => entry === "singleImage" || entry === "startEndRequired" || /^imageReference:\d+$/i.test(String(entry || "")));
 };
 
+const axiosWithRetry = async (fn: () => Promise<any>) => {
+  try {
+    return await fn();
+  } catch (e: any) {
+    if (!/(EAI_AGAIN|ENOTFOUND|ECONNRESET|ETIMEDOUT|timeout)/i.test(`${e?.code || ""} ${e?.message || ""}`)) throw e;
+    logger(`[LingkeAI network] retry after ${e?.code || e?.message || e}`);
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    return await fn();
+  }
+};
+
 const submitMediaTask = async (body: Record<string, any>, timeout: number): Promise<string> => {
-  const response = await axios.post(`${getBaseUrl()}/media/generate`, body, { headers: getHeaders() });
+  const response = await axiosWithRetry(() => axios.post(`${getBaseUrl()}/media/generate`, body, { headers: getHeaders(), timeout: 60000 }));
   const submitData = response.data;
   const immediate = extractMedia(submitData);
   if (immediate) return await toBase64(immediate);
@@ -491,10 +503,13 @@ const submitMediaTask = async (body: Record<string, any>, timeout: number): Prom
 
   const result = await pollTask(
     async (): Promise<PollResult> => {
-      const statusResp = await axios.get(`${getBaseUrl()}/media/status`, {
-        headers: getHeaders(),
-        params: { task_id: taskId },
-      });
+      const statusResp = await axiosWithRetry(() =>
+        axios.get(`${getBaseUrl()}/media/status`, {
+          headers: getHeaders(),
+          params: { task_id: taskId },
+          timeout: 30000,
+        }),
+      );
       const statusData = statusResp.data;
       const state = extractState(statusData);
       const status = extractStatus(statusData);

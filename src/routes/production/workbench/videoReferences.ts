@@ -7,7 +7,17 @@ export type VideoReferenceInput = { id?: number | null; sources?: string; path?:
 export type ResolvedReference = { path: string; sources: string };
 export type TransferSetting = { baseUrl?: string; token?: string };
 
-const referenceFallbackKeywords = ["无法读取文件", "参考图内容问题", "file content read failed", "invalid reference", "base64 unsupported"];
+const referenceFallbackKeywords = [
+  "无法读取文件",
+  "参考图内容问题",
+  "file content read failed",
+  "invalid reference",
+  "base64 unsupported",
+  "reference media needs a public url",
+  "reference urls are unreachable",
+  "asset base url",
+  "getaddrinfo enotfound",
+];
 
 export function normalizeTransferSetting(value: unknown): TransferSetting | undefined {
   if (!value || typeof value !== "object") return undefined;
@@ -197,7 +207,8 @@ async function uploadTransferReference(reference: ReferenceList, transferSetting
     throw new Error(`公网中转上传失败：${response.status} ${data?.error || data?.message || text || response.statusText}`);
   }
 
-  return { ...reference, sourceType: "url", base64: data.url, publicUrl: data.url, expiresAt: data.expiresAt };
+  const url = String(data.publicUrl || data.url).replace("/api/ai-ad-transfer/file/", "/ai-ad-temp/");
+  return { ...reference, sourceType: "url", base64: url, publicUrl: url, expiresAt: data.expiresAt };
 }
 
 export async function uploadReferenceListToTransfer(referenceList: ReferenceList[], transferSetting: TransferSetting): Promise<ReferenceList[]> {

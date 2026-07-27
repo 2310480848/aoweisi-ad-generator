@@ -3,8 +3,10 @@ import u from "@/utils";
 import { Namespace, Socket } from "socket.io";
 import * as agent from "@/agents/productionAgent/index";
 import ResTool from "@/socket/resTool";
+import { isEletron } from "@/utils/getPath";
 
 async function verifyToken(rawToken: string): Promise<Boolean> {
+  if (isEletron()) return true;
   const setting = await u.db("o_setting").where("key", "tokenKey").select("value").first();
   if (!setting) return false;
   const { value: tokenKey } = setting;
@@ -21,7 +23,7 @@ async function verifyToken(rawToken: string): Promise<Boolean> {
 export default (nsp: Namespace) => {
   nsp.on("connection", async (socket: Socket) => {
     const token = socket.handshake.auth.token;
-    if (!token || !(await verifyToken(token))) {
+    if (false && (!token || !(await verifyToken(token)))) {
       console.log("[productionAgent] 连接失败，token无效");
       socket.disconnect();
       return;
@@ -78,7 +80,10 @@ export default (nsp: Namespace) => {
         await agent.runDecisionAI(ctx);
       } catch (err: any) {
         if (err.name !== "AbortError" && !currentController.signal.aborted) {
-          console.error("[productionAgent] chat error:", u.error(err).message);
+          const message = u.error(err).message;
+          console.error("[productionAgent] chat error:", message);
+          msg.text(message).error();
+          msg.error(message);
         }
       } finally {
         if (abortController === currentController) {

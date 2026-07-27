@@ -43,6 +43,15 @@ const AiTypeValues: AiType[] = [
   "productionAgent:storyboardTableAgent",
   "universalAi",
 ];
+
+function sanitizeVendorInputValues(id: string, rawInputValues: string | null | undefined) {
+  const inputValues = JSON.parse(rawInputValues ?? "{}");
+  if (id === "lingkeai" && /trycloudflare\.com/i.test(String(inputValues.assetBaseUrl || ""))) {
+    inputValues.assetBaseUrl = "";
+  }
+  return inputValues;
+}
+
 async function resolveModelName(value: AiType | `${string}:${string}`): Promise<`${string}:${string}`> {
   if (AiTypeValues.includes(value as AiType)) {
     const agentUseModeVal = await u.db("o_setting").where("key", "agentUseMode").first();
@@ -126,7 +135,11 @@ async function getVendorTemplateFn(fnName: FnName, modelName: `${string}:${strin
   const jsCode = transform(code, { transforms: ["typescript"] }).code;
   const running = u.vm(jsCode);
   if (running.vendor) {
-    Object.assign(running.vendor.inputValues, JSON.parse(vendorConfigData.inputValues ?? "{}"));
+    const inputValues = sanitizeVendorInputValues(id, vendorConfigData.inputValues);
+    Object.assign(running.vendor.inputValues, inputValues);
+    if (id === "lingkeai" && /trycloudflare\.com/i.test(String(vendorConfigData.inputValues || ""))) {
+      await u.db("o_vendorConfig").where("id", id).update({ inputValues: JSON.stringify(inputValues) });
+    }
     running.vendor.models = modelList;
   }
   const fn = running[fnName];

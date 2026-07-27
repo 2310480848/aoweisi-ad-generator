@@ -1,4 +1,4 @@
-import { app, BrowserWindow, protocol, systemPreferences } from "electron";
+import { app, BrowserWindow, dialog, protocol, systemPreferences } from "electron";
 import path from "path";
 import fs from "fs";
 import Module from "module";
@@ -8,14 +8,28 @@ app.commandLine.appendSwitch("disable-gpu-shader-disk-cache");
 app.commandLine.appendSwitch("disable-features", "CalculateNativeWinOcclusion");
 
 const TARGET_ENTRIES = new Set(["assets", "models", "serve", "skills", "web", "vendor"]);
+let logFilePath = "";
 
-function copyDir(src: string, dest: string): void {
+function logStartup(...items: unknown[]): void {
+  const line = `[${new Date().toISOString()}] ${items
+    .map((item) => (item instanceof Error ? item.stack || item.message : String(item)))
+    .join(" ")}\n`;
+  try {
+    if (!logFilePath) return;
+    fs.mkdirSync(path.dirname(logFilePath), { recursive: true });
+    fs.appendFileSync(logFilePath, line, "utf-8");
+  } catch {
+    // Startup logging must never break app launch.
+  }
+}
+
+function copyDir(src: string, dest: string, overwrite = false): void {
   if (!fs.existsSync(src)) return;
   fs.mkdirSync(dest, { recursive: true });
   for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
     const s = path.join(src, entry.name);
     const d = path.join(dest, entry.name);
-    entry.isDirectory() ? copyDir(s, d) : fs.existsSync(d) || fs.copyFileSync(s, d);
+    entry.isDirectory() ? copyDir(s, d, overwrite) : (overwrite || !fs.existsSync(d)) && fs.copyFileSync(s, d);
   }
 }
 
@@ -57,9 +71,8 @@ function initializeData(): void {
 
   for (const dir of TARGET_ENTRIES) {
     const targetDir = path.join(destDir, dir);
-    if (shouldForceReplace) {
-      fs.rmSync(targetDir, { recursive: true, force: true });
-      copyDir(path.join(srcDir, dir), targetDir);
+    if (shouldForceReplace || dir === "web" || dir === "serve") {
+      copyDir(path.join(srcDir, dir), targetDir, true);
       continue;
     }
     if (!fs.existsSync(targetDir)) {
@@ -92,6 +105,22 @@ function getNodeModulesPaths(): string[] {
 }
 
 //动态加载
+function addSharpDllPath(): void {
+  if (!app.isPackaged) return;
+  const sharpLibPath = path.join(
+    process.resourcesPath,
+    "app.asar.unpacked",
+    "node_modules",
+    "@img",
+    "sharp-win32-x64",
+    "lib"
+  );
+  if (fs.existsSync(sharpLibPath)) {
+    process.env.PATH = `${sharpLibPath}${path.delimiter}${process.env.PATH ?? ""}`;
+    logStartup("sharp dll path", sharpLibPath);
+  }
+}
+
 function requireWithCustomPaths(modulePath: string): any {
   const appNodeModulesPaths = getNodeModulesPaths();
   // 保存原始方法
@@ -119,8 +148,19 @@ function requireWithCustomPaths(modulePath: string): any {
 }
 
 let mainWindow: BrowserWindow | null = null;
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
 
-function createMainWindow(): Promise<void> {
+if (!gotSingleInstanceLock) {
+  app.exit(0);
+} else {
+  app.on("second-instance", () => {
+    if (!mainWindow) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.focus();
+  });
+}
+
+function createMainWindow(apiBaseUrl?: string): Promise<void> {
   return new Promise((resolve) => {
     const win = new BrowserWindow({
       width: 1000,
@@ -153,7 +193,8 @@ function createMainWindow(): Promise<void> {
       const htmlPath = isDev
         ? path.join(process.cwd(), "data", "web", "index.html")
         : path.join(app.getPath("userData"), "data", "web", "index.html");
-      void win.loadFile(htmlPath);
+      logStartup("load file", htmlPath, "exists=", fs.existsSync(htmlPath));
+      void win.loadFile(htmlPath, apiBaseUrl ? { query: { api: apiBaseUrl } } : undefined);
     }
   });
 }
@@ -172,6 +213,8 @@ protocol.registerSchemesAsPrivileged([
 ]);
 
 app.whenReady().then(async () => {
+  logFilePath = path.join(app.getPath("userData"), "logs", "startup.log");
+  logStartup("app ready", "packaged=", app.isPackaged, "resources=", process.resourcesPath);
   try {
     let servePath: string;
     if (app.isPackaged) {
@@ -183,11 +226,14 @@ app.whenReady().then(async () => {
       // 开发环境：直接加载源码（tsx 通过 -r tsx 注册了 require 钩子）
       servePath = path.join(process.cwd(), "src", "app.ts");
     }
+    logStartup("serve path", servePath, "exists=", fs.existsSync(servePath));
+    addSharpDllPath();
     // 使用自定义路径加载模块
     const mod = requireWithCustomPaths(servePath);
     closeServeFn = mod.closeServe;
     const port = await mod.default(true);
     process.env.PORT = port;
+    logStartup("serve started", "port=", port);
     await new Promise<void>((resolve, reject) => {
       setTimeout(() => {
         resolve();
@@ -266,9 +312,14 @@ app.whenReady().then(async () => {
     });
 
     // 服务启动成功，创建主窗口（主窗口 ready-to-show 时自动关闭loading）
-    await createMainWindow();
+    await createMainWindow(process.env.URL ?? `http://localhost:${port}/api`);
   } catch (err) {
     console.error("[服务启动失败]:", err);
+    logStartup("startup failed", err);
+    dialog.showErrorBox(
+      "AOWEISI 后端启动失败",
+      `请先安装程序目录里的 vc_redist.x64.exe，然后重新打开 AOWEISI.exe。\n\n日志位置：${logFilePath}`
+    );
     await createMainWindow();
   }
 });

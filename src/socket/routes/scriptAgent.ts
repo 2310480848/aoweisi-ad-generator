@@ -3,8 +3,10 @@ import u from "@/utils";
 import { Namespace, Socket } from "socket.io";
 import * as agent from "@/agents/scriptAgent/index";
 import ResTool from "@/socket/resTool";
+import { isEletron } from "@/utils/getPath";
 
 async function verifyToken(rawToken: string): Promise<Boolean> {
+  if (isEletron()) return true;
   const setting = await u.db("o_setting").where("key", "tokenKey").select("value").first();
   if (!setting) return false;
   const { value: tokenKey } = setting;

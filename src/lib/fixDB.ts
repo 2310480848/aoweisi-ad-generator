@@ -217,6 +217,11 @@ async function tempOnsert(tsCode: string) {
   const vendor = exports.vendor;
   const data = await u.db("o_vendorConfig").where("id", vendor.id).first();
   if (data) {
+    if (vendor.id === "lingkeai" && /trycloudflare\.com/i.test(String(data.inputValues || ""))) {
+      const inputValues = JSON.parse(data.inputValues ?? "{}");
+      inputValues.assetBaseUrl = "";
+      await u.db("o_vendorConfig").where("id", vendor.id).update({ inputValues: JSON.stringify(inputValues) });
+    }
     u.vendor.writeCode(vendor.id, tsCode);
     return;
   }
