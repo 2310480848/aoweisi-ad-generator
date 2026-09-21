@@ -18,6 +18,9 @@ type RouteModulePair = { routePath: string; varName: string; entry: string };
 export default async function generateRouter(): Promise<void> {
   // glob 得到 entries
   let entries: string[] = await fg(["src/routes/**/*.ts"]);
+  entries = (
+    await Promise.all(entries.map(async (entry) => ((await readFile(entry, "utf8")).match(/\bexport\s+default\b/) ? entry : "")))
+  ).filter(Boolean);
   // 排序
   entries = entries.sort((a, b) => a.localeCompare(b));
 

@@ -240637,13 +240637,20 @@ function extensionFromMime(mime) {
   };
   return map3[mime] || "bin";
 }
+function summarizeTransferUploadError(status, body, statusText) {
+  const message = body.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim() || statusText;
+  if (status >= 500) {
+    return `Public transfer service is unavailable (${status}). Configure LingkeAI Asset Base URL to a public /oss address and retry.`;
+  }
+  return `Public transfer upload failed (${status}) ${message}`.slice(0, 500);
+}
 async function uploadTransferReference(reference, transferSetting) {
   const setting = normalizeTransferSetting(transferSetting);
-  if (!setting) throw new Error("\u516C\u7F51\u4E2D\u8F6C\u672A\u914D\u7F6E");
+  if (!setting) throw new Error("Public transfer is not configured");
   const existingUrl = reference.publicUrl || (/^https?:\/\//i.test(reference.base64) ? reference.base64 : "");
   if (existingUrl) return { ...reference, sourceType: "url", publicUrl: existingUrl, base64: existingUrl };
   const buffer = decodeBase64Data(reference.base64);
-  if (!buffer) throw new Error("\u53C2\u8003\u7D20\u6750\u4E0D\u662F\u6709\u6548 base64\uFF0C\u65E0\u6CD5\u4E0A\u4F20\u5230\u516C\u7F51\u4E2D\u8F6C");
+  if (!buffer) throw new Error("Reference media is not valid base64 and cannot be uploaded to public transfer");
   const mime = mimeFromDataUrl(reference.base64, reference.type);
   const form = new FormData();
   form.append("file", new Blob([buffer], { type: mime }), `reference.${extensionFromMime(mime)}`);
@@ -240660,9 +240667,9 @@ async function uploadTransferReference(reference, transferSetting) {
     data = { error: text2 };
   }
   if (!response.ok || !data?.url) {
-    throw new Error(`\u516C\u7F51\u4E2D\u8F6C\u4E0A\u4F20\u5931\u8D25\uFF1A${response.status} ${data?.error || data?.message || text2 || response.statusText}`);
+    throw new Error(summarizeTransferUploadError(response.status, data?.error || data?.message || text2, response.statusText));
   }
-  const url4 = String(data.publicUrl || data.url).replace("/api/ai-ad-transfer/file/", "/ai-ad-temp/");
+  const url4 = String(data.publicUrl || data.url);
   return { ...reference, sourceType: "url", base64: url4, publicUrl: url4, expiresAt: data.expiresAt };
 }
 async function uploadReferenceListToTransfer(referenceList, transferSetting) {

@@ -177,15 +177,23 @@ function extensionFromMime(mime: string): string {
   return map[mime] || "bin";
 }
 
+function summarizeTransferUploadError(status: number, body: string, statusText: string): string {
+  const message = body.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim() || statusText;
+  if (status >= 500) {
+    return `Public transfer service is unavailable (${status}). Configure LingkeAI Asset Base URL to a public /oss address and retry.`;
+  }
+  return `Public transfer upload failed (${status}) ${message}`.slice(0, 500);
+}
+
 async function uploadTransferReference(reference: ReferenceList, transferSetting: TransferSetting): Promise<ReferenceList> {
   const setting = normalizeTransferSetting(transferSetting);
-  if (!setting) throw new Error("公网中转未配置");
+  if (!setting) throw new Error("Public transfer is not configured");
 
   const existingUrl = reference.publicUrl || (/^https?:\/\//i.test(reference.base64) ? reference.base64 : "");
   if (existingUrl) return { ...reference, sourceType: "url", publicUrl: existingUrl, base64: existingUrl };
 
   const buffer = decodeBase64Data(reference.base64);
-  if (!buffer) throw new Error("参考素材不是有效 base64，无法上传到公网中转");
+  if (!buffer) throw new Error("Reference media is not valid base64 and cannot be uploaded to public transfer");
 
   const mime = mimeFromDataUrl(reference.base64, reference.type);
   const form = new FormData();
@@ -204,10 +212,10 @@ async function uploadTransferReference(reference: ReferenceList, transferSetting
     data = { error: text };
   }
   if (!response.ok || !data?.url) {
-    throw new Error(`公网中转上传失败：${response.status} ${data?.error || data?.message || text || response.statusText}`);
+    throw new Error(summarizeTransferUploadError(response.status, data?.error || data?.message || text, response.statusText));
   }
 
-  const url = String(data.publicUrl || data.url).replace("/api/ai-ad-transfer/file/", "/ai-ad-temp/");
+  const url = String(data.publicUrl || data.url);
   return { ...reference, sourceType: "url", base64: url, publicUrl: url, expiresAt: data.expiresAt };
 }
 
